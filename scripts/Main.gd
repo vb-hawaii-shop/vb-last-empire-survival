@@ -1,5 +1,12 @@
 extends Node3D
 
+const MALL_DATA = preload("res://scripts/Mall.gd")
+const MALL_PANEL = preload("res://scripts/MallPanel.gd")
+var mall = MALL_DATA.new()
+var mall_ui: Control
+var hero_actor: Node3D
+var hero_label: Label
+
 const SAVE_PATH = "user://save.json"
 const LOCATIONS = {"HQ": Vector3(-10,0,-10), "Farm": Vector3(10,0,-10), "Oil": Vector3(-10,0,10), "Barracks": Vector3(10,0,10)}
 var food: int = 600
@@ -40,6 +47,7 @@ func _ready() -> void:
     load_game()
     create_world()
     create_ui()
+    update_hero_actor()
     refresh()
 
 func box(parent: Node3D, pos: Vector3, size: Vector3, tint: Color) -> MeshInstance3D:
@@ -218,6 +226,9 @@ func create_ui() -> void:
     scroll.add_child(column)
     label_in(column,"VB LAST EMPIRE",26).modulate = Color("e5b35b")
     label_in(column,"SURVIVAL  /  COMMAND CENTER",13)
+    button_in(column,"ITEM MALL  /  HEROES",show_mall)
+    hero_label = label_in(column,"",15)
+    hero_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
     resources = label_in(column,"")
     column.add_child(HSeparator.new())
     details = label_in(column,"")
@@ -322,11 +333,11 @@ func update_battle(delta: float) -> void:
         person.position.z -= delta * (1.5 + minf(victories*0.08,1.5))
         person.position.y = absf(sin(elapsed*7 + enemy.phase))*0.14
         if person.position.z <= 21:
-            health = maxf(0,health-delta*2.5)
+            health = maxf(0,health-delta*2.5*(1.0-mall.bonuses().y))
             person.position.z = 21
     shot_clock -= delta
     if shot_clock <= 0 and not enemies.is_empty():
-        shot_clock = maxf(0.09,0.65 / (1.0 + troops*0.045 + int(levels["Barracks"])*0.12))
+        shot_clock = maxf(0.09,0.65 / (1.0 + troops*0.045 + int(levels["Barracks"])*0.12) / (1.0+mall.bonuses().x))
         var enemy: Dictionary = enemies[0]
         var target: Node3D = enemy.node
         var origin := Vector3(-5 if enemies.size() % 2 == 0 else 5,4.8,24)
@@ -357,7 +368,10 @@ func end_wave(won: bool) -> void:
         food += 80 + victories*10
         oil += 50 + victories*5
         metal += 35 + victories*5
-        status.text = "VICTORY! Supplies recovered. Lost %d soldiers." % losses
+        mall.credits = mini(9999999,mall.credits+120+victories*5)
+        if victories % 3 == 0:
+            mall.bag.hero_crate = mini(9999,int(mall.bag.hero_crate)+1)
+        status.text = "VICTORY! +%d credits. Lost %d soldiers.%s" % [120+victories*5,losses," +1 HERO CRATE!" if victories % 3 == 0 else ""]
     else:
         status.text = "BASE OVERRUN! Repair and train to try again. Lost %d soldiers." % losses
     cooldown = 12
@@ -379,13 +393,20 @@ func claim_mission() -> void:
         food += 150
         oil += 100
         metal += 100
-        status.text = "Mission reward: +150 food, +100 oil, +100 metal!"
+        mall.credits = mini(9999999,mall.credits+200)
+        status.text = "Mission reward: supplies + 200 mall credits!"
         save_game()
     else:
         status.text = "Complete the current objective first."
     refresh()
 
 func refresh() -> void:
+    if mall.equipped.is_empty():
+        hero_label.text = "CREDITS %d  /  No hero assigned" % mall.credits
+    else:
+        var hero: Dictionary = mall.hero_by_id(mall.equipped)
+        hero_label.text = "%s  Lv.%d  /  %d CREDITS" % [hero.name,mall.owned[mall.equipped].level,mall.credits]
+        hero_label.modulate = MALL_DATA.COLORS[int(hero.rarity)]
     resources.text = "FOOD  %d     OIL  %d\nMETAL  %d     TROOPS  %d\nBASE  %d%%    WAVES  %d" % [food,oil,metal,troops,int(health),victories]
     var cost: int = int(levels[selected])*80
     details.text = "%s  /  LEVEL %d\nUpgrade: %d food + oil + metal" % [selected,levels[selected],cost]
@@ -426,7 +447,7 @@ func save_game() -> void:
         return
     var file := FileAccess.open(SAVE_PATH+".tmp",FileAccess.WRITE)
     if file:
-        file.store_string(JSON.stringify({"version":2,"food":food,"oil":oil,"metal":metal,"troops":troops,"victories":victories,"levels":levels,"cooldown":cooldown,"health":health,"training":training,"mission":mission}))
+        file.store_string(JSON.stringify({"version":3,"mall":mall.to_dict(),"food":food,"oil":oil,"metal":metal,"troops":troops,"victories":victories,"levels":levels,"cooldown":cooldown,"health":health,"training":training,"mission":mission}))
         file.close()
         DirAccess.rename_absolute(SAVE_PATH+".tmp",SAVE_PATH)
 
@@ -436,6 +457,7 @@ func load_game() -> void:
     var data = JSON.parse_string(FileAccess.get_file_as_string(SAVE_PATH))
     if not data is Dictionary:
         return
+    mall.load_data(data.get("mall",{}))
     food = clampi(int(data.get("food",food)),0,9999999)
     oil = clampi(int(data.get("oil",oil)),0,9999999)
     metal = clampi(int(data.get("metal",data.get("steel",metal))),0,9999999)
@@ -529,3 +551,99 @@ func _unhandled_input(event: InputEvent) -> void:
             if dragging:
                 pan_by(event.relative)
         touches[event.index] = event.position
+
+
+func show_mall() -> void:
+    if fighting:
+        status.text = "Finish the defense before opening the mall."
+        return
+    if is_instance_valid(mall_ui):
+        return
+    mall_ui = MALL_PANEL.new()
+    mall_ui.state = mall
+    mall_ui.action_requested.connect(mall_action)
+    mall_ui.closed.connect(close_mall)
+    var layer := CanvasLayer.new()
+    layer.name = "MallLayer"
+    layer.layer = 10
+    add_child(layer)
+    layer.add_child(mall_ui)
+    # Clear map gestures so a release over the overlay never leaves a stale touch.
+    touches.clear()
+    mouse_down = false
+
+func close_mall() -> void:
+    if is_instance_valid(mall_ui):
+        mall_ui = null
+        get_node("MallLayer").queue_free()
+
+func mall_action(action: String, id: String) -> void:
+    if fighting:
+        return
+    var message: String = ""
+    if action == "BUY":
+        message = "Added to your bag: " + str(MALL_DATA.SHOP[id].name) if mall.buy(id) else "Not enough credits, or bag is full."
+    elif action == "OPEN":
+        var result: Dictionary = mall.open_crate()
+        if result.is_empty():
+            message = "No hero crates. Buy one in Shop or earn one every 3 victories."
+        else:
+            mall_ui.result = result
+            var hero: Dictionary = mall.hero_by_id(result.id)
+            message = "Recruited: " + str(hero.name) + ("  /  Duplicate +10 shards" if result.duplicate else "  /  NEW HERO!")
+            update_hero_actor()
+    elif action == "EQUIP":
+        message = "Commander assigned." if mall.equip(id) else "Hero is locked."
+        update_hero_actor()
+    elif action == "UPGRADE_HERO":
+        message = "Hero leveled up! Bonuses increased." if mall.upgrade(id) else "Need more matching shards, or hero is at max level."
+    elif action == "USE":
+        if id == "hero_crate":
+            mall_ui.tab = "CRATES"
+            message = "Choose OPEN 1 CRATE to recruit a hero."
+        elif int(mall.bag.get(id,0)) <= 0:
+            message = "No items available."
+        elif id == "supply_pack":
+            food += 250
+            oil += 250
+            metal += 250
+            mall.bag[id] = int(mall.bag[id])-1
+            message = "Supplies delivered: +250 food, oil and metal."
+        elif id == "speedup":
+            if training <= 0:
+                message = "Start training first. Your boost has been kept."
+            else:
+                training = 0
+                troops += 5
+                mall.bag[id] = int(mall.bag[id])-1
+                message = "Training complete! 5 soldiers ready."
+        elif id == "repair_kit":
+            if health >= 100:
+                message = "Base is fully repaired. Your kit has been kept."
+            else:
+                health = minf(100,health+40)
+                mall.bag[id] = int(mall.bag[id])-1
+                message = "Repair kit used: +40 base health."
+    if is_instance_valid(mall_ui):
+        mall_ui.message = message
+        mall_ui.rebuild()
+    status.text = message
+    save_game()
+    refresh()
+
+func update_hero_actor() -> void:
+    if is_instance_valid(hero_actor):
+        hero_actor.queue_free()
+    if mall.equipped.is_empty():
+        return
+    var hero: Dictionary = mall.hero_by_id(mall.equipped)
+    hero_actor = make_person(MALL_DATA.COLORS[int(hero.rarity)])
+    hero_actor.position = Vector3(0,0,17)
+    hero_actor.scale = Vector3.ONE*1.4
+    var nameplate := Label3D.new()
+    nameplate.text = str(hero.name)
+    nameplate.position.y = 3.1
+    nameplate.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+    nameplate.modulate = MALL_DATA.COLORS[int(hero.rarity)]
+    nameplate.font_size = 28
+    hero_actor.add_child(nameplate)
